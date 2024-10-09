@@ -156,7 +156,7 @@ extension PersistenceReaderKey {
 /// See ``PersistenceReaderKey/appStorage(_:)-4l5b`` to create values of this type.
 public struct AppStorageKey<Value: Sendable>: Sendable {
   private let lookup: any Lookup<Value>
-  private let key: String
+  fileprivate let key: String
   private let store: UncheckedSendable<UserDefaults>
 
   public var id: AnyHashable {
@@ -290,23 +290,21 @@ extension AppStorageKey: PersistenceKey {
     didSet: @escaping @Sendable (_ newValue: Value?) -> Void
   ) -> Shared<Value>.Subscription {
     let previousValue = LockIsolated(initialValue)
-    let userDefaultsDidChange = NotificationCenter.default.addObserver(
-      forName: UserDefaults.didChangeNotification,
-      object: self.store.wrappedValue,
-      queue: nil
-    ) { _ in
+    
+    let observation = store.wrappedValue.observe(keyPath: key, options: [.new, .old]) { (object, change: ObservedChange<Value>) in
       let newValue = load(initialValue: initialValue)
       defer { previousValue.withValue { $0 = newValue } }
+
       guard
         !(_isEqual(newValue as Any, previousValue.value as Any) ?? false)
           || (_isEqual(newValue as Any, initialValue as Any) ?? true)
       else {
         return
       }
-      guard !SharedAppStorageLocals.isSetting
-      else { return }
+      guard !SharedAppStorageLocals.isSetting else { return }
       didSet(newValue)
     }
+    
     let willEnterForeground: (any NSObjectProtocol)?
     if let willEnterForegroundNotificationName {
       willEnterForeground = NotificationCenter.default.addObserver(
@@ -320,7 +318,7 @@ extension AppStorageKey: PersistenceKey {
       willEnterForeground = nil
     }
     return Shared.Subscription {
-      NotificationCenter.default.removeObserver(userDefaultsDidChange)
+      observation.invalidate()
       if let willEnterForeground {
         NotificationCenter.default.removeObserver(willEnterForeground)
       }
@@ -451,4 +449,80 @@ private struct OptionalLookup<Base: Lookup>: Lookup {
       store.removeObject(forKey: key)
     }
   }
+}
+
+private struct ObservedChange<T> {
+    let oldValue: T?
+    let newValue: T?
+}
+
+private final class KVOObservation {
+    private let onInvalidate: () -> Void
+    
+    // Initialize with an invalidation closure
+    init(onInvalidate: @escaping () -> Void) {
+        self.onInvalidate = onInvalidate
+    }
+    
+    // Call this to invalidate (cancel) the observation
+    func invalidate() {
+        onInvalidate()
+    }
+}
+
+private extension NSObject {
+    func observe<Value>(
+        keyPath: String,
+        options: NSKeyValueObservingOptions = [.new, .old],
+        changeHandler: @escaping (NSObject, ObservedChange<Value>) -> Void
+    ) -> KVOObservation {
+        // Add KVO observer with the specific key path
+        let observation = addObserver(forKeyPath: keyPath, options: options, context: nil) { object, change in
+            let oldValue = change[.oldKey] as? Value
+            let newValue = change[.newKey] as? Value
+            
+            let observedChange = ObservedChange<Value>(
+                oldValue: oldValue,
+                newValue: newValue
+            )
+            
+            changeHandler(object, observedChange)
+        }
+
+        // Return a token that can be used to invalidate the observation
+        return KVOObservation { [weak self] in
+            self?.removeObserver(observation, forKeyPath: keyPath)
+        }
+    }
+}
+
+private extension NSObject {
+    func addObserver(
+        forKeyPath keyPath: String,
+        options: NSKeyValueObservingOptions,
+        context: UnsafeMutableRawPointer?,
+        changeHandler: @escaping (NSObject, [NSKeyValueChangeKey: Any]) -> Void
+    ) -> NSObject {
+        let observer = KVOObserver(changeHandler: changeHandler)
+        addObserver(observer, forKeyPath: keyPath, options: options, context: context)
+        return observer
+    }
+}
+
+private class KVOObserver: NSObject {
+    private let changeHandler: (NSObject, [NSKeyValueChangeKey: Any]) -> Void
+
+    init(changeHandler: @escaping (NSObject, [NSKeyValueChangeKey: Any]) -> Void) {
+        self.changeHandler = changeHandler
+    }
+
+    override func observeValue(
+        forKeyPath keyPath: String?,
+        of object: Any?,
+        change: [NSKeyValueChangeKey: Any]?,
+        context: UnsafeMutableRawPointer?
+    ) {
+        guard let object = object as? NSObject, let change = change else { return }
+        changeHandler(object, change)
+    }
 }
